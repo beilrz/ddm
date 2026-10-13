@@ -39,6 +39,46 @@ export function getMissingFields(
 }
 
 /**
+ * Splits a data row into one row per key matched by a regex-field rule.
+ *
+ * If a rule with `regex_field` matches more than one key of the row, each sub-row contains all
+ * keys not matched by that rule plus exactly one of the matched keys. Only the first such rule
+ * is expanded. If no regex-field rule matches more than one key, the row is returned as is.
+ *
+ * @param dataRow - A single row of data as a key-value object.
+ * @param extractionRules - Array of extraction rule objects.
+ * @returns The sub-rows to be extracted in place of `dataRow`.
+ */
+export function expandMultiMatchRows(
+  dataRow: Record<string, any>,
+  extractionRules: ExtractionRule[]
+): Record<string, any>[] {
+  const rowKeys = Object.keys(dataRow);
+
+  for (const rule of extractionRules) {
+    if (!rule.regex_field) continue;
+
+    let matchedKeys: string[];
+    try {
+      const regex = new RegExp(rule.field);
+      matchedKeys = rowKeys.filter(key => regex.test(key));
+    } catch {
+      continue;  // Invalid regex is reported by getKeyMap.
+    }
+    if (matchedKeys.length < 2) continue;
+
+    const otherKeys = rowKeys.filter(key => !matchedKeys.includes(key));
+    return matchedKeys.map(matchedKey => {
+      const subRow: Record<string, any> = {};
+      for (const key of otherKeys) subRow[key] = dataRow[key];
+      subRow[matchedKey] = dataRow[matchedKey];
+      return subRow;
+    });
+  }
+  return [dataRow];
+}
+
+/**
  * Builds a mapping between expected fields (defined in extraction rules) and actual keys in the data row.
  *
  * For each rule, the function attempts to match the rule's field against the keys in the data row,

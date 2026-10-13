@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractData, getKeyMap } from '@uploader/composables/useFileProcessor/extractionEngine';
+import { expandMultiMatchRows, extractData, getKeyMap } from '@uploader/composables/useFileProcessor/extractionEngine';
 import { useFileProcessor } from '@uploader/composables/useFileProcessor';
 import { BlueprintExtractionOutcome } from '@uploader/classes/BlueprintExtractionOutcome';
 import { Blueprint } from '@uploader/types/Blueprint';
@@ -8,6 +8,7 @@ import messageData from './fixtures/MessageData.json';
 
 const CHAT_PATTERN = '^test:chat:.*';
 const FIRST_CHAT_KEY = 'test:chat:792179ee83d1';
+const SECOND_CHAT_KEY = 'test:chat:123PFFwj1W2Z11';
 
 // Keeps only messages that are exactly a "test:<type>:<id>" URI; replaces all other message texts.
 const REDACT_NON_URI_MESSAGES = '("message":")(?!test:[a-z-]+:[A-Za-z0-9]+")(?:[^"\\\\]|\\\\.)*(")';
@@ -48,6 +49,17 @@ function extractRow(dataRow: Record<string, any>, rules: ExtractionRule[]) {
   const keyMap = getKeyMap(dataRow, rules, blueprint.id, outcomeMap);
   extractData(dataRow, rules, keyMap, blueprint.id, outcomeMap);
   return { extracted: outcomeMap[blueprint.id].extractedData[0], outcome: outcomeMap[blueprint.id] };
+}
+
+// Like extractRow, but expands multi-match regex fields first (as processContent does for JSON).
+function extractRows(dataRow: Record<string, any>, rules: ExtractionRule[]) {
+  const blueprint = makeBlueprint(rules);
+  const outcomeMap = { [blueprint.id]: new BlueprintExtractionOutcome(blueprint) };
+  for (const subRow of expandMultiMatchRows(dataRow, rules)) {
+    const keyMap = getKeyMap(subRow, rules, blueprint.id, outcomeMap);
+    extractData(subRow, rules, keyMap, blueprint.id, outcomeMap);
+  }
+  return { extracted: outcomeMap[blueprint.id].extractedData, outcome: outcomeMap[blueprint.id] };
 }
 
 describe('regex-replace-match', () => {
@@ -138,6 +150,30 @@ describe('regex-delete-row', () => {
   });
 });
 
+describe('expandMultiMatchRows', () => {
+  const regexRule = rule({ field: '^chat_.*', regex_field: true });
+
+  it('returns the row unchanged if a regex field matches at most one key', () => {
+    const row = { chat_a: 1, other: 2 };
+    expect(expandMultiMatchRows(row, [regexRule])).toEqual([row]);
+  });
+
+  it('returns the row unchanged if no rule uses a regex field', () => {
+    const row = { chat_a: 1, chat_b: 2 };
+    expect(expandMultiMatchRows(row, [rule({ field: 'chat_a' })])).toEqual([row]);
+  });
+
+  it('returns one row per matched key and keeps non-matching keys in every row', () => {
+    const rows = expandMultiMatchRows({ chat_a: 1, chat_b: 2, other: 3 }, [regexRule]);
+    expect(rows).toEqual([{ other: 3, chat_a: 1 }, { other: 3, chat_b: 2 }]);
+  });
+
+  it('ignores a rule with an invalid regex', () => {
+    const row = { chat_a: 1, chat_b: 2 };
+    expect(expandMultiMatchRows(row, [rule({ field: '(unclosed', regex_field: true })])).toEqual([row]);
+  });
+});
+
 describe('redacting chat messages (MessageData.json)', () => {
   const rules = [
     rule({ id: 1, field: CHAT_PATTERN, regex_field: true }),
@@ -145,30 +181,30 @@ describe('redacting chat messages (MessageData.json)', () => {
           comparison_value: REDACT_NON_URI_MESSAGES, replacement_value: '$1_removed_$2' })
   ];
 
-  function assertRedacted(chat: any) {
-    const messages = chat.messages.map((m: any) => m.message);
-    expect(messages).toEqual([
-      '_removed_',
-      'test:playlist:8f7da08c5f1a',
-      '_removed_',
-      'test:track:9d0f947aed4b',
-      '_removed_'
-    ]);
+  // Expected message texts per chat: everything except "test:<type>:<id>" URIs is redacted.
+  const expectedMessages = {
+    [FIRST_CHAT_KEY]: ['_removed_', 'test:playlist:8f7da08c5f1a', '_removed_', 'test:track:9d0f947aed4b', '_removed_'],
+    [SECOND_CHAT_KEY]: ['_removed_', 'test:playlist:c2f07acbff2e']
+  };
+
+  function assertRedacted(chat: any, chatKey: string) {
+    expect(chat.messages.map((m: any) => m.message)).toEqual(expectedMessages[chatKey]);
     // Everything except the message texts is untouched.
-    const original = messageData[FIRST_CHAT_KEY];
+    const original = messageData[chatKey];
     expect(chat.members).toEqual(original.members);
     expect(chat.messages.map((m: any) => m.uri)).toEqual(original.messages.map(m => m.uri));
   }
 
-  it('redacts non-URI messages (unit)', () => {
-    const { extracted } = extractRow(structuredClone(messageData), rules);
-    // The rule's field matches both chats; only the first one is extracted (known limitation).
-    const value = extracted[CHAT_PATTERN];
-    expect(typeof value).toBe('string');
-    assertRedacted(JSON.parse(value));
+  it('redacts non-URI messages in every chat (unit)', () => {
+    const { extracted, outcome } = extractRows(structuredClone(messageData), rules);
+    // One extracted row per chat; values are JSON strings stored under the pattern.
+    expect(extracted.length).toBe(2);
+    assertRedacted(JSON.parse(extracted[0][CHAT_PATTERN]), FIRST_CHAT_KEY);
+    assertRedacted(JSON.parse(extracted[1][CHAT_PATTERN]), SECOND_CHAT_KEY);
+    expect(outcome.extractionRuleLog[2]).toBe(2);
   });
 
-  it('redacts non-URI messages (end to end via useFileProcessor)', async () => {
+  it('redacts non-URI messages in every chat (end to end via useFileProcessor)', async () => {
     const blueprint = makeBlueprint(rules, {
       expected_fields: [CHAT_PATTERN],
       exp_fields_regex_matching: true,
@@ -179,7 +215,8 @@ describe('redacting chat messages (MessageData.json)', () => {
     await processor.handleSelectedFile(file);
 
     const extracted = processor.blueprintOutcomeMap[1].extractedData;
-    expect(extracted.length).toBe(1);
-    assertRedacted(JSON.parse(extracted[0][CHAT_PATTERN]));
+    expect(extracted.length).toBe(2);
+    assertRedacted(JSON.parse(extracted[0][CHAT_PATTERN]), FIRST_CHAT_KEY);
+    assertRedacted(JSON.parse(extracted[1][CHAT_PATTERN]), SECOND_CHAT_KEY);
   });
 });

@@ -2,7 +2,7 @@ import Papa from "papaparse";
 import {ERROR_CATALOG} from "@uploader/utils/errorCatalog";
 import {Blueprint} from "@uploader/types/Blueprint";
 import {BlueprintExtractionOutcome} from "@uploader/classes/BlueprintExtractionOutcome";
-import {extractData, getKeyMap, getMissingFields} from "@uploader/composables/useFileProcessor/extractionEngine";
+import {expandMultiMatchRows, extractData, getKeyMap, getMissingFields} from "@uploader/composables/useFileProcessor/extractionEngine";
 
 /**
  * Processes a single file's content using a provided blueprint definition.
@@ -54,9 +54,16 @@ export function processContent(
       continue;
     }
 
+    // JSON only: a regex field matching several keys yields one row per matched key.
+    const subRows = blueprint.format === 'json'
+      ? expandMultiMatchRows(dataRow, blueprint.extraction_rules)
+      : [dataRow];
+
     // Construct key map and extract data.
-    const keyMap = getKeyMap(dataRow, blueprint.extraction_rules, blueprint.id, blueprintOutcomeMap);
-    extractData(dataRow, blueprint.extraction_rules, keyMap, blueprint.id, blueprintOutcomeMap);
+    for (const subRow of subRows) {
+      const keyMap = getKeyMap(subRow, blueprint.extraction_rules, blueprint.id, blueprintOutcomeMap);
+      extractData(subRow, blueprint.extraction_rules, keyMap, blueprint.id, blueprintOutcomeMap);
+    }
   }
 }
 
